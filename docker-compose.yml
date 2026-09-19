@@ -1,0 +1,84 @@
+services:
+  diary-service:
+    build: .
+    restart: unless-stopped
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      HTTP_PORT: 8082
+      DATABASE_URL: postgres://diary:diary@diary-postgres:5432/diary?sslmode=disable
+      AUTH_JWKS_URL: ${AUTH_JWKS_URL:-http://auth-service:8080/.well-known/jwks.json}
+      JWT_ISSUER: ${JWT_ISSUER:-sport-diary-auth}
+      JWT_AUDIENCE: ${JWT_AUDIENCE:-sport-diary-api}
+      JWT_CLOCK_SKEW: ${JWT_CLOCK_SKEW:-30s}
+      PROFILE_SERVICE_URL: ${PROFILE_SERVICE_URL:-http://profile-service:8081}
+      PROFILE_SERVICE_TIMEOUT: ${PROFILE_SERVICE_TIMEOUT:-2s}
+      DIARY_TIME_ZONE: ${DIARY_TIME_ZONE:-Europe/Moscow}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      KAFKA_SEEDS: diary-kafka:9092
+      KAFKA_TOPIC_COACHATHLETE: ${KAFKA_TOPIC_COACHATHLETE:-coach-athlete-events}
+      KAFKA_TOPIC_TRAININGPLAN: ${KAFKA_TOPIC_TRAININGPLAN:-training-plan-events}
+      KAFKA_TOPIC_WORKOUT: ${KAFKA_TOPIC_WORKOUT:-workout-events}
+      KAFKA_TOPIC_WORKOUTRESULT: ${KAFKA_TOPIC_WORKOUTRESULT:-workout-result-events}
+      KAFKA_TOPIC_DAILYCHECKIN: ${KAFKA_TOPIC_DAILYCHECKIN:-daily-checkin-events}
+      KAFKA_TOPIC_GOAL: ${KAFKA_TOPIC_GOAL:-goal-events}
+    ports:
+      - "8082:8082"
+    depends_on:
+      diary-postgres:
+        condition: service_healthy
+      diary-kafka:
+        condition: service_healthy
+    networks:
+      - common_net
+
+  diary-postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: diary
+      POSTGRES_USER: diary
+      POSTGRES_PASSWORD: diary
+    volumes:
+      - diary_postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U diary -d diary"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    networks:
+      - common_net
+
+  diary-kafka:
+    image: apache/kafka:4.1.0
+    hostname: diary-kafka
+    restart: unless-stopped
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@diary-kafka:9093
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://diary-kafka:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      CLUSTER_ID: 4L6g3nShT-eMCtK--X86sw
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+    networks:
+      - common_net
+
+volumes:
+  diary_postgres_data:
+
+networks:
+  common_net:
+    external: true
+    name: common_net

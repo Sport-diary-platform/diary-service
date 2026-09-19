@@ -1,0 +1,11 @@
+DROP TABLE IF EXISTS outbox_events;
+DROP TABLE IF EXISTS workout_comments;
+DROP TABLE IF EXISTS goals;
+DROP TABLE IF EXISTS daily_check_ins;
+DROP TABLE IF EXISTS exercise_results;
+DROP TABLE IF EXISTS workout_results;
+DROP TABLE IF EXISTS exercises;
+DROP TABLE IF EXISTS workout_blocks;
+DROP TABLE IF EXISTS workouts;
+DROP TABLE IF EXISTS training_plans;
+DROP TABLE IF EXISTS coach_athlete_relationships;

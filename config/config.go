@@ -24,6 +24,8 @@ type Config struct {
 	HTTP        HTTP
 	Database    Database
 	Auth        Auth
+	Profile     Profile
+	Calendar    Calendar
 	LogLevel    Logger
 	Kafka       Kafka
 }
@@ -43,18 +45,30 @@ type Auth struct {
 	ClockSkew time.Duration `env:"JWT_CLOCK_SKEW,required,unset"`
 }
 
+type Profile struct {
+	URL     string        `env:"PROFILE_SERVICE_URL,required,unset"`
+	Timeout time.Duration `env:"PROFILE_SERVICE_TIMEOUT" envDefault:"2s"`
+}
+
+type Calendar struct {
+	TimeZone string `env:"DIARY_TIME_ZONE" envDefault:"Europe/Moscow"`
+}
+
 type Logger struct {
 	Level string `env:"LOG_LEVEL,required"`
 }
 
 type Kafka struct {
-	Seeds             []string `env:"KAFKA_SEEDS,unset"`
-	TopicCoachAthlete string   `env:"KAFKA_TOPIC_COACHATHLETE"`
-	TopicTrainingPlan string   `env:"KAFKA_TOPIC_TRAININGPLAN"`
-	TopicWorkout      string   `env:"KAFKA_TOPIC_WORKOUT"`
-	TopiWorkoutResult string   `env:"KAFKA_TOPIC_WORKOUTRESULT"`
-	TopicDailyCheckIn string   `env:"KAFKA_TOPIC_DAILYCHECKIN"`
-	TopicGoal         string   `env:"KAFKA_TOPIC_GOAL"`
+	Seeds              []string      `env:"KAFKA_SEEDS,required,unset"`
+	TopicCoachAthlete  string        `env:"KAFKA_TOPIC_COACHATHLETE,required"`
+	TopicTrainingPlan  string        `env:"KAFKA_TOPIC_TRAININGPLAN,required"`
+	TopicWorkout       string        `env:"KAFKA_TOPIC_WORKOUT,required"`
+	TopicWorkoutResult string        `env:"KAFKA_TOPIC_WORKOUTRESULT,required"`
+	TopicDailyCheckIn  string        `env:"KAFKA_TOPIC_DAILYCHECKIN,required"`
+	TopicGoal          string        `env:"KAFKA_TOPIC_GOAL,required"`
+	OutboxPollInterval time.Duration `env:"OUTBOX_POLL_INTERVAL" envDefault:"1s"`
+	OutboxLease        time.Duration `env:"OUTBOX_LEASE" envDefault:"30s"`
+	OutboxBatchSize    int           `env:"OUTBOX_BATCH_SIZE" envDefault:"100"`
 }
 
 func NewConfig() (*Config, error) {

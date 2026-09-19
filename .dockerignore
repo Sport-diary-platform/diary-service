@@ -1,0 +1,7 @@
+.git
+.env
+.idea
+.vscode
+coverage.out
+tests
+*.md

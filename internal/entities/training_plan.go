@@ -9,22 +9,22 @@ import (
 type StatusPlan string
 
 const (
-	StatusPlanDraft StatusPlan = "draft"
-	StatusPlanActive StatusPlan = "active"
+	StatusPlanDraft     StatusPlan = "draft"
+	StatusPlanActive    StatusPlan = "active"
 	StatusPlanCompleted StatusPlan = "completed"
-	StatusPlanCancelled StatusPlan = "canceled"
+	StatusPlanCancelled StatusPlan = "cancelled"
 )
 
-
 type TrainingPlan struct {
-	id uuid.UUID
-	CoachID uuid.UUID
-	AthleteID uuid.UUID
-	Name string
-	Description string
-	StartDate time.Time
-	EndDate *time.Time
-	Status StatusPlan
-	CreatedAt time.Time
-	UpdatedAt time.Time
+	ID          uuid.UUID
+	CoachID     uuid.UUID
+	AthleteID   uuid.UUID
+	Name        string
+	Description *string
+	StartDate   LocalDate
+	EndDate     *LocalDate
+	Status      StatusPlan
+	Version     int64
+	CreatedAt   time.Time
+	UpdatedAt   time.Time
 }

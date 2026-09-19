@@ -9,16 +9,16 @@ import (
 type StatusRel string
 
 const (
-	StatusRelActive StatusRel = "active"
-	StatusRelTerminates StatusRel = "terminated"
+	StatusRelActive     StatusRel = "active"
+	StatusRelTerminated StatusRel = "terminated"
 )
 
-
 type CoachAthleteRelationship struct {
-	ID uuid.UUID
-	CoachID uuid.UUID
+	ID        uuid.UUID
+	CoachID   uuid.UUID
 	AthleteID uuid.UUID
-	Status StatusRel
+	Status    StatusRel
+	Version   int64
 	CreatedAt time.Time
 	UpdatedAt time.Time
 }

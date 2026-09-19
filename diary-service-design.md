@@ -126,7 +126,7 @@ type WorkoutRepository interface {
 
 Важно: контракт repository layer находится непосредственно в `internal/repository`, согласно принятой структуре проекта.
 
-#### `internal/handler`
+#### `internal/controller/http`
 
 Fiber HTTP handlers, request parsing, validation HTTP-входа, response mapping.
 
@@ -139,6 +139,7 @@ Fiber HTTP handlers, request parsing, validation HTTP-входа, response mappi
 - handlers;
 - router;
 - dependencies;
+- явный запуск миграций после загрузки конфигурации (не через package `init`);
 - lifecycle;
 - graceful shutdown.
 
@@ -220,6 +221,7 @@ CoachAthleteRelationship
 ├── CoachID
 ├── AthleteID
 ├── Status
+├── Version
 ├── CreatedAt
 └── UpdatedAt
 ```
@@ -234,15 +236,20 @@ terminated
 Инварианты:
 
 - `coach_id != athlete_id`;
-- одна связь между конкретным coach и athlete;
+- одновременно может существовать только одна активная связь между конкретным coach и athlete;
 - тренер может работать с athlete только при активной связи.
+- после termination новая связь создаётся новой строкой с новым ID; завершённая запись сохраняется в истории.
 
 База:
 
 ```sql
-UNIQUE (coach_id, athlete_id)
+CREATE UNIQUE INDEX uq_active_relationship
+ON coach_athlete_relationships (coach_id, athlete_id)
+WHERE status = 'active';
 CHECK (coach_id <> athlete_id)
 ```
+
+В MVP coach сразу создаёт активную связь. Invite/accept flow оставлен для следующей версии.
 
 `coach_id` и `athlete_id` являются UUID пользователей из auth-service.
 
@@ -264,6 +271,7 @@ TrainingPlan
 ├── StartDate
 ├── EndDate
 ├── Status
+├── Version
 ├── CreatedAt
 └── UpdatedAt
 ```
@@ -305,6 +313,8 @@ cancelled -> completed
 EndDate >= StartDate
 ```
 
+Активный TrainingPlan разрешено редактировать. `CoachID` и `AthleteID` после создания не меняются. Изменения защищены optimistic locking по `Version`.
+
 ---
 
 # 8. Workout
@@ -321,9 +331,10 @@ Workout
 ├── Description
 ├── SportType
 ├── ScheduledAt
-├── EstimatedDuration
+├── EstimatedDurationSeconds
 ├── Status
 ├── Blocks[]
+├── Version
 ├── CreatedAt
 └── UpdatedAt
 ```
@@ -334,6 +345,7 @@ Workout
 
 ```text
 planned
+completed
 cancelled
 ```
 
@@ -344,6 +356,15 @@ in_progress
 skipped
 ```
 
+Допустимые переходы:
+
+```text
+planned -> completed   // автоматически при создании WorkoutResult
+planned -> cancelled
+```
+
+`completed` и `cancelled` являются терминальными состояниями. Отдельной ручной операции complete для Workout нет.
+
 ### Инварианты
 
 - title не пустой;
@@ -352,6 +373,9 @@ skipped
 - estimated duration, если задан, > 0;
 - block position уникален внутри workout;
 - exercise position уникален внутри block.
+- `CoachID` и `AthleteID` после создания не меняются;
+- Workout можно редактировать только в статусе `planned`, пока для него нет WorkoutResult;
+- Workout можно физически удалить только создавшему его coach, только в статусе `planned` и только пока результата нет.
 
 ### Domain methods
 
@@ -359,6 +383,7 @@ skipped
 
 ```go
 func (w *Workout) Cancel() error
+func (w *Workout) Complete() error
 func (w *Workout) AddBlock(block WorkoutBlock) error
 func (w *Workout) RemoveBlock(blockID uuid.UUID) error
 ```
@@ -489,6 +514,7 @@ WorkoutResult
 ├── Feeling
 ├── Comment
 ├── ExerciseResults[]
+├── Version
 ├── CreatedAt
 └── UpdatedAt
 ```
@@ -552,6 +578,7 @@ ExerciseResult
 ├── ExerciseID
 ├── Actual
 ├── Comment
+├── Version
 ├── CreatedAt
 └── UpdatedAt
 ```
@@ -633,6 +660,8 @@ DailyCheckIn
 UNIQUE (athlete_id, date)
 ```
 
+`Date` является календарной датой в часовом поясе `Europe/Moscow` и передаётся через API в формате `YYYY-MM-DD`. Это не timestamp.
+
 Оценки:
 
 ```sql
@@ -660,6 +689,7 @@ Goal
 ├── Target
 ├── Deadline
 ├── Status
+├── Version
 ├── CreatedAt
 └── UpdatedAt
 ```
@@ -709,6 +739,7 @@ WorkoutComment
 ├── WorkoutID
 ├── AuthorID
 ├── Text
+├── Version
 ├── CreatedAt
 └── UpdatedAt
 ```
@@ -742,6 +773,17 @@ OutboxEvent
 
 `PublishedAt = NULL` означает, что событие ещё не опубликовано.
 
+Для безопасной работы нескольких outbox workers также хранятся:
+
+```text
+AvailableAt
+LockedUntil
+Attempts
+LastError
+```
+
+Worker атомарно захватывает доступную пачку событий, устанавливая lease в `LockedUntil`. При ошибке увеличивает `Attempts`, сохраняет `LastError` и переносит `AvailableAt` с backoff. После успешной публикации заполняет `PublishedAt`.
+
 Индекс:
 
 ```sql
@@ -762,14 +804,18 @@ CREATE TABLE coach_athlete_relationships (
     coach_id UUID NOT NULL,
     athlete_id UUID NOT NULL,
     status VARCHAR(32) NOT NULL,
+    version BIGINT NOT NULL DEFAULT 1,
     created_at TIMESTAMPTZ NOT NULL,
     updated_at TIMESTAMPTZ NOT NULL,
 
     CONSTRAINT chk_relationship_different_users
         CHECK (coach_id <> athlete_id),
 
-    CONSTRAINT uq_relationship
-        UNIQUE (coach_id, athlete_id)
+    CONSTRAINT chk_relationship_status
+        CHECK (status IN ('active', 'terminated')),
+
+    CONSTRAINT chk_relationship_version
+        CHECK (version > 0)
 );
 ```
 
@@ -781,6 +827,10 @@ CREATE INDEX idx_relationships_coach
 
 CREATE INDEX idx_relationships_athlete
     ON coach_athlete_relationships(athlete_id);
+
+CREATE UNIQUE INDEX uq_active_relationship
+    ON coach_athlete_relationships(coach_id, athlete_id)
+    WHERE status = 'active';
 ```
 
 ---
@@ -800,12 +850,19 @@ CREATE TABLE training_plans (
     end_date DATE,
 
     status VARCHAR(32) NOT NULL,
+    version BIGINT NOT NULL DEFAULT 1,
 
     created_at TIMESTAMPTZ NOT NULL,
     updated_at TIMESTAMPTZ NOT NULL,
 
     CONSTRAINT chk_training_plan_dates
-        CHECK (end_date IS NULL OR end_date >= start_date)
+        CHECK (end_date IS NULL OR end_date >= start_date),
+
+    CONSTRAINT chk_training_plan_status
+        CHECK (status IN ('draft', 'active', 'completed', 'cancelled')),
+
+    CONSTRAINT chk_training_plan_version
+        CHECK (version > 0)
 );
 ```
 
@@ -838,18 +895,25 @@ CREATE TABLE workouts (
     sport_type VARCHAR(64) NOT NULL,
 
     scheduled_at TIMESTAMPTZ NOT NULL,
-    estimated_duration INTEGER,
+    estimated_duration_seconds INTEGER,
 
     status VARCHAR(32) NOT NULL,
+    version BIGINT NOT NULL DEFAULT 1,
 
     created_at TIMESTAMPTZ NOT NULL,
     updated_at TIMESTAMPTZ NOT NULL,
 
     CONSTRAINT chk_workout_duration
         CHECK (
-            estimated_duration IS NULL
-            OR estimated_duration > 0
-        )
+            estimated_duration_seconds IS NULL
+            OR estimated_duration_seconds > 0
+        ),
+
+    CONSTRAINT chk_workout_status
+        CHECK (status IN ('planned', 'completed', 'cancelled')),
+
+    CONSTRAINT chk_workout_version
+        CHECK (version > 0)
 );
 ```
 
@@ -884,7 +948,10 @@ CREATE TABLE workout_blocks (
     updated_at TIMESTAMPTZ NOT NULL,
 
     CONSTRAINT uq_workout_block_position
-        UNIQUE (workout_id, position)
+        UNIQUE (workout_id, position),
+
+    CONSTRAINT chk_workout_block_position
+        CHECK (position >= 0)
 );
 ```
 
@@ -910,7 +977,10 @@ CREATE TABLE exercises (
     updated_at TIMESTAMPTZ NOT NULL,
 
     CONSTRAINT uq_exercise_position
-        UNIQUE (workout_block_id, position)
+        UNIQUE (workout_block_id, position),
+
+    CONSTRAINT chk_exercise_position
+        CHECK (position >= 0)
 );
 ```
 
@@ -939,6 +1009,7 @@ CREATE TABLE workout_results (
     feeling SMALLINT NOT NULL,
 
     comment TEXT,
+    version BIGINT NOT NULL DEFAULT 1,
 
     created_at TIMESTAMPTZ NOT NULL,
     updated_at TIMESTAMPTZ NOT NULL,
@@ -962,7 +1033,10 @@ CREATE TABLE workout_results (
         CHECK (
             distance_meters IS NULL
             OR distance_meters >= 0
-        )
+        ),
+
+    CONSTRAINT chk_workout_result_version
+        CHECK (version > 0)
 );
 ```
 
@@ -987,6 +1061,7 @@ CREATE TABLE exercise_results (
     actual JSONB NOT NULL,
 
     comment TEXT,
+    version BIGINT NOT NULL DEFAULT 1,
 
     created_at TIMESTAMPTZ NOT NULL,
     updated_at TIMESTAMPTZ NOT NULL,
@@ -1039,7 +1114,10 @@ CREATE TABLE daily_check_ins (
         CHECK (soreness BETWEEN 1 AND 10),
 
     CONSTRAINT chk_motivation
-        CHECK (motivation BETWEEN 1 AND 10)
+        CHECK (motivation BETWEEN 1 AND 10),
+
+    CONSTRAINT chk_daily_check_in_version
+        CHECK (version > 0)
 );
 ```
 
@@ -1063,9 +1141,19 @@ CREATE TABLE goals (
     deadline DATE,
 
     status VARCHAR(32) NOT NULL,
+    version BIGINT NOT NULL DEFAULT 1,
 
     created_at TIMESTAMPTZ NOT NULL,
-    updated_at TIMESTAMPTZ NOT NULL
+    updated_at TIMESTAMPTZ NOT NULL,
+
+    CONSTRAINT chk_goal_status
+        CHECK (status IN ('active', 'completed', 'cancelled')),
+
+    CONSTRAINT chk_goal_type
+        CHECK (type IN ('performance', 'weight', 'distance', 'time', 'strength', 'custom')),
+
+    CONSTRAINT chk_goal_version
+        CHECK (version > 0)
 );
 ```
 
@@ -1091,9 +1179,13 @@ CREATE TABLE workout_comments (
     author_id UUID NOT NULL,
 
     text TEXT NOT NULL,
+    version BIGINT NOT NULL DEFAULT 1,
 
     created_at TIMESTAMPTZ NOT NULL,
-    updated_at TIMESTAMPTZ NOT NULL
+    updated_at TIMESTAMPTZ NOT NULL,
+
+    CONSTRAINT chk_workout_comment_version
+        CHECK (version > 0)
 );
 ```
 
@@ -1121,7 +1213,17 @@ CREATE TABLE outbox_events (
     payload JSONB NOT NULL,
 
     created_at TIMESTAMPTZ NOT NULL,
-    published_at TIMESTAMPTZ
+    published_at TIMESTAMPTZ,
+    available_at TIMESTAMPTZ NOT NULL,
+    locked_until TIMESTAMPTZ,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    last_error TEXT,
+
+    CONSTRAINT chk_outbox_event_version
+        CHECK (event_version > 0),
+
+    CONSTRAINT chk_outbox_attempts
+        CHECK (attempts >= 0)
 );
 ```
 
@@ -1129,7 +1231,7 @@ CREATE TABLE outbox_events (
 
 ```sql
 CREATE INDEX idx_outbox_unpublished
-    ON outbox_events(created_at)
+    ON outbox_events(available_at, created_at)
     WHERE published_at IS NULL;
 ```
 
@@ -1143,23 +1245,29 @@ CREATE INDEX idx_outbox_unpublished
 
 ```text
 workout_blocks.workout_id -> workouts.id
+    ON DELETE CASCADE
 
 exercises.workout_block_id -> workout_blocks.id
+    ON DELETE CASCADE
 
 workout_results.workout_id -> workouts.id
+    ON DELETE RESTRICT
 
 exercise_results.workout_result_id -> workout_results.id
+    ON DELETE CASCADE
 
 exercise_results.exercise_id -> exercises.id
+    ON DELETE RESTRICT
 
 workout_comments.workout_id -> workouts.id
+    ON DELETE CASCADE
 ```
 
 Для relationships/training plans/workouts с `coach_id`/`athlete_id` FK на auth-service не используется.
 
-Для `training_plan_id` -> `training_plans.id` рекомендуется FK.
+Для `training_plan_id` -> `training_plans.id` используется FK с `ON DELETE SET NULL`.
 
-При удалении parent-сущности следует использовать поведение, соответствующее lifecycle. В большинстве случаев бизнес-операции должны использовать domain status/soft lifecycle, а не физическое удаление.
+Физическое удаление предусмотрено только для ошибочно созданного Workout. Usecase до удаления обязан проверить владельца, статус `planned`, отсутствие WorkoutResult и ожидаемую версию. Blocks, exercises и comments являются дочерними данными агрегата и удаляются каскадно. Наличие result блокирует удаление на уровне бизнес-логики и FK.
 
 ---
 
@@ -1189,7 +1297,10 @@ POST   /workouts
 GET    /workouts/:id
 PUT    /workouts/:id
 POST   /workouts/:id/cancel
+DELETE /workouts/:id
 ```
+
+Все update/state-change endpoints передают ожидаемую версию агрегата. Для `DELETE` версия передаётся через `If-Match`; несовпадение возвращает `409 Conflict`.
 
 Списки:
 
@@ -1205,6 +1316,47 @@ POST /workouts/:id/result
 GET  /workouts/:id/result
 PUT  /workouts/:id/result
 ```
+
+## Relationships
+
+```text
+POST /relationships
+POST /relationships/:id/terminate
+GET  /relationships/athletes
+GET  /relationships/coaches
+```
+
+В MVP coach создаёт активную relationship сразу. После termination повторное подключение создаёт новую строку.
+
+## Daily check-ins
+
+```text
+POST /check-ins
+GET  /check-ins/:date
+PUT  /check-ins/:date
+GET  /check-ins?from=YYYY-MM-DD&to=YYYY-MM-DD
+```
+
+## Goals
+
+```text
+POST /goals
+GET  /goals/:id
+PUT  /goals/:id
+POST /goals/:id/complete
+POST /goals/:id/cancel
+GET  /goals
+```
+
+## Workout comments
+
+```text
+POST /workouts/:workoutID/comments
+GET  /workouts/:workoutID/comments
+PUT  /workouts/:workoutID/comments/:commentID
+```
+
+Идентификатор текущего пользователя берётся из проверенного JWT. Идентификаторы владельца не принимаются из request body там, где их можно однозначно получить из authenticated principal.
 
 ---
 
@@ -1250,13 +1402,14 @@ Usecase должен:
 
 1. получить Workout;
 2. проверить, что текущий пользователь — athlete этого Workout;
-3. проверить, что Workout не cancelled;
+3. проверить, что Workout находится в статусе planned;
 4. проверить, что WorkoutResult ещё не существует;
 5. проверить ExerciseResult → Exercise принадлежность этому Workout;
 6. создать WorkoutResult;
 7. создать ExerciseResults;
-8. создать OutboxEvent;
-9. выполнить всё в одной транзакции.
+8. атомарно перевести Workout `planned -> completed` с проверкой ожидаемой версии;
+9. создать OutboxEvents `workout_result.created` и `workout.completed`;
+10. выполнить всё в одной транзакции.
 
 ---
 
@@ -1293,6 +1446,7 @@ skipped
 ```text
 Workout exists
 AND WorkoutResult does not exist
+AND Workout.status = planned
 AND scheduled_at < now
 ```
 
@@ -1378,10 +1532,10 @@ Auth-service отвечает за:
 login
 password
 JWT generation
-JWT validation
+JWKS publication
 ```
 
-Diary-service получает:
+Diary-service самостоятельно валидирует JWT в middleware по JWKS auth-service. Проверяются подпись, `exp`, `nbf`, issuer и audience. После проверки diary-service получает:
 
 ```text
 userID
@@ -1397,7 +1551,7 @@ user
 admin
 ```
 
-Для получения типа профиля (athlete/coach) следует сделать GET запрос к profile-service:
+Для получения типа профиля (athlete/coach) следует сделать GET запрос к profile-service с настроенным timeout:
 
 ```
 curl http://localhost:8081/api/v1/internal/profiles/{user_id} 
@@ -1407,6 +1561,8 @@ response:
 ```
 {"profile_type":"athlete"}
 ```
+
+Один пользователь имеет ровно один тип профиля: `athlete` или `coach`. `userID` берётся из проверенного claim `sub`; значения owner/author из HTTP body не считаются доверенными.
 
 ### Примеры
 
@@ -1462,7 +1618,7 @@ type WorkoutRepository interface {
     Create(ctx context.Context, workout *entities.Workout) error
     GetByID(ctx context.Context, workoutID uuid.UUID) (*entities.Workout, error)
     Update(ctx context.Context, workout *entities.Workout) error
-    Delete(ctx context.Context, workoutID uuid.UUID) error
+    Delete(ctx context.Context, workoutID uuid.UUID, expectedVersion int64) error
 
     ListByAthlete(
         ctx context.Context,
@@ -1544,7 +1700,7 @@ type DailyCheckInRepository interface {
     GetByDate(
         ctx context.Context,
         athleteID uuid.UUID,
-        date time.Time,
+        date entities.LocalDate,
     ) (*entities.DailyCheckIn, error)
 
     Update(
@@ -1555,7 +1711,7 @@ type DailyCheckInRepository interface {
     List(
         ctx context.Context,
         athleteID uuid.UUID,
-        from, to time.Time,
+        from, to entities.LocalDate,
     ) ([]entities.DailyCheckIn, error)
 }
 ```
@@ -1588,7 +1744,7 @@ type RelationshipRepository interface {
         relationship *entities.CoachAthleteRelationship,
     ) error
 
-    Get(
+    GetActive(
         ctx context.Context,
         coachID, athleteID uuid.UUID,
     ) (*entities.CoachAthleteRelationship, error)
@@ -1601,6 +1757,7 @@ type RelationshipRepository interface {
     Terminate(
         ctx context.Context,
         relationshipID uuid.UUID,
+        expectedVersion int64,
     ) error
 
     ListAthletes(
@@ -1649,14 +1806,23 @@ type OutboxRepository interface {
         event *entities.OutboxEvent,
     ) error
 
-    GetUnpublished(
+    ClaimUnpublished(
         ctx context.Context,
         limit int,
+        lockedUntil time.Time,
     ) ([]entities.OutboxEvent, error)
 
     MarkPublished(
         ctx context.Context,
         eventID uuid.UUID,
+        publishedAt time.Time,
+    ) error
+
+    MarkFailed(
+        ctx context.Context,
+        eventID uuid.UUID,
+        availableAt time.Time,
+        cause string,
     ) error
 }
 ```
@@ -1681,6 +1847,7 @@ type TransactionManager interface {
 ```text
 workout_results
 exercise_results
+workouts (planned -> completed, version + 1)
 outbox_events
 ```
 
@@ -1696,6 +1863,8 @@ outbox_events
 internal/usecase
 ```
 
+HTTP request DTO и usecase command — разные структуры. Request содержит transport validation и JSON tags. Command содержит только разрешённые поля и доверенный `ActorID`, полученный middleware из проверенного JWT. Usecase создаёт entity после authorization и domain validation. Create/update операции не принимают готовую entity из HTTP-слоя.
+
 ## WorkoutUseCase
 
 ```go
@@ -1707,6 +1876,7 @@ type WorkoutUseCase interface {
 
     GetByID(
         ctx context.Context,
+        actorID uuid.UUID,
         workoutID uuid.UUID,
     ) (*entities.Workout, error)
 
@@ -1717,18 +1887,21 @@ type WorkoutUseCase interface {
 
     Cancel(
         ctx context.Context,
-        workoutID uuid.UUID,
+        cmd ChangeWorkoutStateCommand,
     ) error
+
+    Delete(ctx context.Context, cmd ChangeWorkoutStateCommand) error
 
     ListByAthlete(
         ctx context.Context,
+        actorID uuid.UUID,
         athleteID uuid.UUID,
         from, to time.Time,
     ) ([]entities.Workout, error)
 
     ListByCoach(
         ctx context.Context,
-        coachID uuid.UUID,
+        actorID uuid.UUID,
         from, to time.Time,
     ) ([]entities.Workout, error)
 }
@@ -1747,6 +1920,7 @@ type WorkoutResultUseCase interface {
 
     GetByWorkoutID(
         ctx context.Context,
+        actorID uuid.UUID,
         workoutID uuid.UUID,
     ) (*entities.WorkoutResult, error)
 
@@ -1770,6 +1944,7 @@ type TrainingPlanUseCase interface {
 
     GetByID(
         ctx context.Context,
+        actorID uuid.UUID,
         planID uuid.UUID,
     ) (*entities.TrainingPlan, error)
 
@@ -1778,9 +1953,9 @@ type TrainingPlanUseCase interface {
         cmd UpdateTrainingPlanCommand,
     ) (*entities.TrainingPlan, error)
 
-    Activate(ctx context.Context, planID uuid.UUID) error
-    Complete(ctx context.Context, planID uuid.UUID) error
-    Cancel(ctx context.Context, planID uuid.UUID) error
+    Activate(ctx context.Context, cmd ChangeTrainingPlanStateCommand) error
+    Complete(ctx context.Context, cmd ChangeTrainingPlanStateCommand) error
+    Cancel(ctx context.Context, cmd ChangeTrainingPlanStateCommand) error
 }
 ```
 
@@ -1797,8 +1972,8 @@ type DailyCheckInUseCase interface {
 
     GetByDate(
         ctx context.Context,
-        athleteID uuid.UUID,
-        date time.Time,
+        actorID uuid.UUID,
+        date entities.LocalDate,
     ) (*entities.DailyCheckIn, error)
 
     Update(
@@ -1808,8 +1983,8 @@ type DailyCheckInUseCase interface {
 
     List(
         ctx context.Context,
-        athleteID uuid.UUID,
-        from, to time.Time,
+        actorID uuid.UUID,
+        from, to entities.LocalDate,
     ) ([]entities.DailyCheckIn, error)
 }
 ```
@@ -1827,6 +2002,7 @@ type GoalUseCase interface {
 
     GetByID(
         ctx context.Context,
+        actorID uuid.UUID,
         goalID uuid.UUID,
     ) (*entities.Goal, error)
 
@@ -1835,8 +2011,9 @@ type GoalUseCase interface {
         cmd UpdateGoalCommand,
     ) (*entities.Goal, error)
 
-    Complete(ctx context.Context, goalID uuid.UUID) error
-    Cancel(ctx context.Context, goalID uuid.UUID) error
+    Complete(ctx context.Context, cmd ChangeGoalStateCommand) error
+    Cancel(ctx context.Context, cmd ChangeGoalStateCommand) error
+    List(ctx context.Context, actorID uuid.UUID) ([]entities.Goal, error)
 }
 ```
 
@@ -1853,17 +2030,17 @@ type RelationshipUseCase interface {
 
     Terminate(
         ctx context.Context,
-        relationshipID uuid.UUID,
+        cmd TerminateRelationshipCommand,
     ) error
 
     ListAthletes(
         ctx context.Context,
-        coachID uuid.UUID,
+        actorID uuid.UUID,
     ) ([]uuid.UUID, error)
 
     ListCoaches(
         ctx context.Context,
-        athleteID uuid.UUID,
+        actorID uuid.UUID,
     ) ([]uuid.UUID, error)
 }
 ```
@@ -1881,6 +2058,7 @@ type CommentUseCase interface {
 
     ListByWorkout(
         ctx context.Context,
+        actorID uuid.UUID,
         workoutID uuid.UUID,
     ) ([]entities.WorkoutComment, error)
 
@@ -1903,6 +2081,8 @@ type CommentUseCase interface {
 var (
     ErrWorkoutNotFound              = errors.New("workout not found")
     ErrWorkoutCancelled             = errors.New("workout is cancelled")
+    ErrWorkoutCompleted             = errors.New("workout is completed")
+    ErrWorkoutHasResult             = errors.New("workout has a result")
     ErrWorkoutResultAlreadyExists   = errors.New("workout result already exists")
     ErrWorkoutResultNotFound        = errors.New("workout result not found")
 
@@ -1919,6 +2099,7 @@ var (
     ErrDailyCheckInNotFound         = errors.New("daily check-in not found")
 
     ErrGoalNotFound                 = errors.New("goal not found")
+    ErrVersionConflict              = errors.New("version conflict")
 )
 ```
 
@@ -1942,11 +2123,31 @@ Repository-specific errors могут находиться в `internal/reposito
 9. Commit transaction.
 ```
 
-Event:
+Events:
 
 ```text
 workout.created
 ```
+
+---
+
+## Business logic: DeleteWorkout
+
+Физическое удаление предназначено только для исправления ошибочного назначения.
+
+```text
+1. Authenticate user and verify profile type is coach.
+2. Load Workout.
+3. Verify workout.coach_id == currentUserID.
+4. Verify Workout status is planned.
+5. Verify WorkoutResult does not exist.
+6. Verify expected Version.
+7. Delete Workout; blocks, exercises and comments are deleted by aggregate FK cascade.
+8. Create workout.deleted OutboxEvent.
+9. Commit transaction.
+```
+
+Удаление и outbox event выполняются в одной транзакции. Если result появился конкурентно, FK `workout_results -> workouts ON DELETE RESTRICT` блокирует удаление.
 
 ---
 
@@ -1959,20 +2160,22 @@ workout.created
 2. Verify user is athlete.
 3. Load Workout.
 4. Verify workout.athlete_id == currentUserID.
-5. Verify Workout is not cancelled.
+5. Verify Workout status is planned and its version matches the command.
 6. Verify WorkoutResult does not exist.
 7. Validate RPE and feeling.
 8. Validate exercise IDs belong to Workout.
 9. Create WorkoutResult.
 10. Create ExerciseResults.
-11. Create OutboxEvent.
-12. Commit transaction.
+11. Change Workout status to completed and increment its version.
+12. Create `workout_result.created` and `workout.completed` OutboxEvents.
+13. Commit transaction.
 ```
 
-Event:
+Events:
 
 ```text
 workout_result.created
+workout.completed
 ```
 
 ---
@@ -2012,7 +2215,9 @@ training_plan.completed
 
 workout.created
 workout.updated
+workout.completed
 workout.cancelled
+workout.deleted
 
 workout_result.created
 workout_result.updated
@@ -2083,6 +2288,8 @@ Kafka
 
 Поэтому consumers должны быть idempotent.
 
+Несколько экземпляров worker используют атомарный claim с lease (`available_at <= now`, `locked_until IS NULL OR locked_until < now`). Выборка выполняется с `FOR UPDATE SKIP LOCKED`. Ошибка публикации увеличивает attempts и назначает следующий retry с backoff; успешная публикация заполняет `published_at`.
+
 ---
 
 
@@ -2127,7 +2334,7 @@ Athlete
 coach_athlete_relationships:
     (coach_id)
     (athlete_id)
-    UNIQUE (coach_id, athlete_id)
+    UNIQUE (coach_id, athlete_id) WHERE status = 'active'
 
 training_plans:
     (athlete_id, start_date)
@@ -2159,7 +2366,7 @@ workout_comments:
     (workout_id, created_at)
 
 outbox_events:
-    partial index on published_at IS NULL
+    partial index on (available_at, created_at) WHERE published_at IS NULL
 ```
 
 ---
@@ -2197,6 +2404,8 @@ DATE
 ```
 
 Для них не следует использовать `time.Time` с timezone semantics, если значение действительно является календарной датой.
+
+В Go календарные даты представлены `entities.LocalDate` в формате `YYYY-MM-DD`. Для DailyCheckIn календарная граница определяется часовым поясом `Europe/Moscow`.
 
 ---
 
@@ -2296,6 +2505,16 @@ Repository не должен решать:
 
 # 57. Concurrency
 
+Все изменяемые aggregate roots содержат `Version BIGINT NOT NULL DEFAULT 1`. Команда update/state change передаёт `ExpectedVersion`, а repository выполняет обновление по условию:
+
+```sql
+UPDATE ...
+SET ..., version = version + 1
+WHERE id = $id AND version = $expected_version;
+```
+
+Ноль изменённых строк преобразуется в `ErrVersionConflict` и HTTP `409 Conflict`. Blocks/exercises изменяются как часть Workout и используют версию родительского агрегата; ExerciseResults — версию WorkoutResult. `event_version` outbox-события не связан с optimistic locking и обозначает версию схемы события.
+
 Особенно важно для:
 
 ```text
@@ -2366,6 +2585,7 @@ CreateWorkout
 GetWorkout
 UpdateWorkout
 CancelWorkout
+DeleteWorkout
 ListAthleteWorkouts
 ListCoachWorkouts
 ```
@@ -2424,7 +2644,7 @@ UpdateComment
 │  Fiber                                              │
 │    │                                                │
 │    ▼                                                │
-│  handler                                            │
+│  controller/http                                    │
 │    │                                                │
 │    ▼                                                │
 │  usecase                                            │
@@ -2460,8 +2680,8 @@ UpdateComment
 
 # 61. Главные архитектурные инварианты
 
-1. `Workout` — это назначение, а не lifecycle выполнения.
-2. `WorkoutResult` — факт выполнения.
+1. `Workout` — это назначение; его `completed` выставляется только автоматически при создании результата.
+2. `WorkoutResult` — факт выполнения и единственная причина перехода Workout в `completed`.
 3. У Workout максимум один WorkoutResult.
 4. WorkoutResult создаёт только athlete этого Workout.
 5. `skipped` не является состоянием Workout.
@@ -2480,3 +2700,6 @@ UpdateComment
 18. Handler interface не создаётся без реального потребителя.
 19. Repository contracts находятся в `internal/repository`.
 20. Usecase contracts находятся в `internal/usecase`.
+21. Изменения aggregate roots защищены optimistic locking по `Version`.
+22. Workout нельзя редактировать или удалить после создания WorkoutResult.
+23. Одновременно существует максимум одна active relationship для пары coach/athlete; повторное подключение создаёт новую строку.

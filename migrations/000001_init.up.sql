@@ -1,17 +1,25 @@
-CREATE TABLE IF N0T EXISTS coach_athlete_relationships (
+CREATE TABLE IF NOT EXISTS coach_athlete_relationships (
     id UUID PRIMARY KEY,
     coach_id UUID NOT NULL,
     athlete_id UUID NOT NULL,
     status VARCHAR(32) NOT NULL,
+    version BIGINT NOT NULL DEFAULT 1,
     created_at TIMESTAMPTZ NOT NULL,
     updated_at TIMESTAMPTZ NOT NULL,
 
     CONSTRAINT chk_relationship_different_users
         CHECK (coach_id <> athlete_id),
 
-    CONSTRAINT uq_relationship
-        UNIQUE (coach_id, athlete_id)
+    CONSTRAINT chk_relationship_status
+        CHECK (status IN ('active', 'terminated')),
+
+    CONSTRAINT chk_relationship_version
+        CHECK (version > 0)
 );
+
+CREATE UNIQUE INDEX uq_active_relationship
+    ON coach_athlete_relationships(coach_id, athlete_id)
+    WHERE status = 'active';
 
 CREATE INDEX idx_relationships_coach
     ON coach_athlete_relationships(coach_id);
@@ -31,12 +39,19 @@ CREATE TABLE training_plans (
     end_date DATE,
 
     status VARCHAR(32) NOT NULL,
+    version BIGINT NOT NULL DEFAULT 1,
 
     created_at TIMESTAMPTZ NOT NULL,
     updated_at TIMESTAMPTZ NOT NULL,
 
     CONSTRAINT chk_training_plan_dates
-        CHECK (end_date IS NULL OR end_date >= start_date)
+        CHECK (end_date IS NULL OR end_date >= start_date),
+
+    CONSTRAINT chk_training_plan_status
+        CHECK (status IN ('draft', 'active', 'completed', 'cancelled')),
+
+    CONSTRAINT chk_training_plan_version
+        CHECK (version > 0)
 );
 
 CREATE INDEX idx_training_plans_athlete
@@ -60,20 +75,28 @@ CREATE TABLE workouts (
     sport_type VARCHAR(64) NOT NULL,
 
     scheduled_at TIMESTAMPTZ NOT NULL,
-    estimated_duration INTEGER,
+    estimated_duration_seconds INTEGER,
 
     status VARCHAR(32) NOT NULL,
+    version BIGINT NOT NULL DEFAULT 1,
 
     created_at TIMESTAMPTZ NOT NULL,
     updated_at TIMESTAMPTZ NOT NULL,
 
     CONSTRAINT chk_workout_duration
         CHECK (
-            estimated_duration IS NULL
-            OR estimated_duration > 0
-        )
-    CONSTRAINT fk_training_plan_id FOREIGN KEY training_plan_id 
-        REFERENCES training_plans(id)
+            estimated_duration_seconds IS NULL
+            OR estimated_duration_seconds > 0
+        ),
+
+    CONSTRAINT chk_workout_status
+        CHECK (status IN ('planned', 'completed', 'cancelled')),
+
+    CONSTRAINT chk_workout_version
+        CHECK (version > 0),
+
+    CONSTRAINT fk_workout_training_plan FOREIGN KEY (training_plan_id)
+        REFERENCES training_plans(id) ON DELETE SET NULL
 );
 
 
@@ -101,9 +124,13 @@ CREATE TABLE workout_blocks (
     updated_at TIMESTAMPTZ NOT NULL,
 
     CONSTRAINT uq_workout_block_position
-        UNIQUE (workout_id, position)
-    CONSTRAINT fk_workout_id FOREIGN KEY workout_id 
-    REFERENCES workouts(id)
+        UNIQUE (workout_id, position),
+
+    CONSTRAINT chk_workout_block_position
+        CHECK (position >= 0),
+
+    CONSTRAINT fk_workout_block_workout FOREIGN KEY (workout_id)
+        REFERENCES workouts(id) ON DELETE CASCADE
 );
 
 CREATE TABLE exercises (
@@ -121,9 +148,13 @@ CREATE TABLE exercises (
     updated_at TIMESTAMPTZ NOT NULL,
 
     CONSTRAINT uq_exercise_position
-        UNIQUE (workout_block_id, position)
-    CONSTRAINT fk_workout_block_id FOREIGN KEY workout_block_id
-    REFERENCES workout_blocks(id)
+        UNIQUE (workout_block_id, position),
+
+    CONSTRAINT chk_exercise_position
+        CHECK (position >= 0),
+
+    CONSTRAINT fk_exercise_workout_block FOREIGN KEY (workout_block_id)
+        REFERENCES workout_blocks(id) ON DELETE CASCADE
 );
 
 
@@ -147,6 +178,7 @@ CREATE TABLE workout_results (
     feeling SMALLINT NOT NULL,
 
     comment TEXT,
+    version BIGINT NOT NULL DEFAULT 1,
 
     created_at TIMESTAMPTZ NOT NULL,
     updated_at TIMESTAMPTZ NOT NULL,
@@ -170,9 +202,13 @@ CREATE TABLE workout_results (
         CHECK (
             distance_meters IS NULL
             OR distance_meters >= 0
-        )
-    CONSTRAINT fk_workout_id FOREIGN KEY workout_id
-    REFERENCES workouts(id)
+        ),
+
+    CONSTRAINT chk_workout_result_version
+        CHECK (version > 0),
+
+    CONSTRAINT fk_workout_result_workout FOREIGN KEY (workout_id)
+        REFERENCES workouts(id) ON DELETE RESTRICT
 );
 
 CREATE INDEX idx_workout_results_athlete
@@ -189,16 +225,20 @@ CREATE TABLE exercise_results (
     actual JSONB NOT NULL,
 
     comment TEXT,
+	version BIGINT NOT NULL DEFAULT 1,
 
     created_at TIMESTAMPTZ NOT NULL,
     updated_at TIMESTAMPTZ NOT NULL,
 
     CONSTRAINT uq_exercise_result
-        UNIQUE (workout_result_id, exercise_id)
-    CONSTRAINT fk_workout_result_id FOREIGN KEY workout_result_id
-        REFERENCES workout_results(id)
-    CONSTRAINT fk_exercise_id FOREIGN KEY exercise_id 
-        REFERENCES exercises(id)
+        UNIQUE (workout_result_id, exercise_id),
+	CONSTRAINT chk_exercise_result_version
+		CHECK (version > 0),
+    CONSTRAINT fk_exercise_result_workout_result FOREIGN KEY (workout_result_id)
+        REFERENCES workout_results(id) ON DELETE CASCADE,
+
+    CONSTRAINT fk_exercise_result_exercise FOREIGN KEY (exercise_id)
+        REFERENCES exercises(id) ON DELETE RESTRICT
 );
 
 
@@ -222,6 +262,7 @@ CREATE TABLE daily_check_ins (
     resting_heart_rate SMALLINT,
 
     comment TEXT,
+    version BIGINT NOT NULL DEFAULT 1,
 
     created_at TIMESTAMPTZ NOT NULL,
     updated_at TIMESTAMPTZ NOT NULL,
@@ -242,7 +283,10 @@ CREATE TABLE daily_check_ins (
         CHECK (soreness BETWEEN 1 AND 10),
 
     CONSTRAINT chk_motivation
-        CHECK (motivation BETWEEN 1 AND 10)
+        CHECK (motivation BETWEEN 1 AND 10),
+
+    CONSTRAINT chk_daily_check_in_version
+        CHECK (version > 0)
 );
 
 
@@ -261,9 +305,19 @@ CREATE TABLE goals (
     deadline DATE,
 
     status VARCHAR(32) NOT NULL,
+    version BIGINT NOT NULL DEFAULT 1,
 
     created_at TIMESTAMPTZ NOT NULL,
-    updated_at TIMESTAMPTZ NOT NULL
+    updated_at TIMESTAMPTZ NOT NULL,
+
+    CONSTRAINT chk_goal_status
+        CHECK (status IN ('active', 'completed', 'cancelled')),
+
+    CONSTRAINT chk_goal_type
+        CHECK (type IN ('performance', 'weight', 'distance', 'time', 'strength', 'custom')),
+
+    CONSTRAINT chk_goal_version
+        CHECK (version > 0)
 );
 
 CREATE INDEX idx_goals_athlete
@@ -281,12 +335,16 @@ CREATE TABLE workout_comments (
     author_id UUID NOT NULL,
 
     text TEXT NOT NULL,
+    version BIGINT NOT NULL DEFAULT 1,
 
     created_at TIMESTAMPTZ NOT NULL,
-    updated_at TIMESTAMPTZ NOT NULL
+    updated_at TIMESTAMPTZ NOT NULL,
 
-    CONSTRAINT fk_workout_id FOREIGN KEY workout_id 
-        REFERENCES workouts(id)
+    CONSTRAINT chk_workout_comment_version
+        CHECK (version > 0),
+
+    CONSTRAINT fk_workout_comment_workout FOREIGN KEY (workout_id)
+        REFERENCES workouts(id) ON DELETE CASCADE
 );
 
 CREATE INDEX idx_workout_comments_workout
@@ -306,9 +364,19 @@ CREATE TABLE outbox_events (
     payload JSONB NOT NULL,
 
     created_at TIMESTAMPTZ NOT NULL,
-    published_at TIMESTAMPTZ
+    published_at TIMESTAMPTZ,
+    available_at TIMESTAMPTZ NOT NULL,
+    locked_until TIMESTAMPTZ,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    last_error TEXT,
+
+    CONSTRAINT chk_outbox_event_version
+        CHECK (event_version > 0),
+
+    CONSTRAINT chk_outbox_attempts
+        CHECK (attempts >= 0)
 );
 
 CREATE INDEX idx_outbox_unpublished
-    ON outbox_events(created_at)
+    ON outbox_events(available_at, created_at)
     WHERE published_at IS NULL;
